@@ -1,11 +1,12 @@
 """
 ingestion/rule_extractor.py
-Hybrid extraction — two separate LLM calls per section:
+Hybrid extraction — two LangChain LLM calls per section:
   1. STRUCTURED extraction -> numbers/tables -> SQLite
   2. SEMANTIC extraction   -> rules/conditions -> ChromaDB
+
+Uses LangChain's ChatGroq wrapper with automatic retry on rate limits.
 """
 import json
-import re
 import time
 from typing import Any
 
@@ -14,6 +15,9 @@ from monitoring import get_logger
 
 log = get_logger(__name__)
 
+# ── Prompts ───────────────────────────────────────────────────────────────────
+# String concatenation only — tariff text may contain { } % characters
+# that would break .format() or % templating.
 
 _STRUCTURED_PROMPT = """You are a port tariff data extraction specialist.
 Extract ALL numeric rates, fees, tiers, surcharges, and reductions from the tariff text below.
@@ -46,62 +50,97 @@ TARIFF TEXT:
 """
 
 
-def _clean_json(raw: str) -> str:
-    """Strip markdown code fences and whitespace from LLM response."""
+def _strip_fences(raw: str) -> str:
+    """Remove markdown code fences from LLM response."""
     raw = raw.strip()
-    # Remove opening fence
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    # Remove closing fence
-    raw = re.sub(r"\s*```\s*$", "", raw)
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        if lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        elif lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        raw = "\n".join(lines)
     return raw.strip()
 
 
 class RuleExtractor:
+    """
+    Uses LangChain's ChatGroq for structured and semantic extraction.
+
+    LangChain benefits here:
+    - Standardised LLM interface — swap provider by changing one import
+    - Built-in message formatting (HumanMessage)
+    - Easy to add output parsers or chains in future
+    """
 
     def __init__(self) -> None:
-        self._client = None
+        self._llm_fast = None   # llama-3.1-8b-instant — for structured JSON
+        self._llm_smart = None  # llama-3.3-70b-versatile — for semantic rules
+
+    def _get_llm(self, model: str):
+        """Lazy-init LangChain ChatGroq instance."""
+        from langchain_groq import ChatGroq
+        return ChatGroq(
+            api_key=settings.groq_api_key,
+            model=model,
+            temperature=0,
+            max_tokens=3000,
+        )
 
     @property
-    def client(self):
-        if self._client is None:
-            from groq import Groq
-            self._client = Groq(api_key=settings.groq_api_key)
-        return self._client
+    def llm_fast(self):
+        if self._llm_fast is None:
+            self._llm_fast = self._get_llm("llama-3.1-8b-instant")
+        return self._llm_fast
 
-    def _call_llm(self, prompt: str, max_tokens: int = 3000, model: str = None) -> str:
-        # Use fast 8b model for structured extraction to save daily token quota
-        # Fall back to settings model for semantic extraction
-        use_model = model or settings.groq_model
-        response = self.client.chat.completions.create(
-            model=use_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=max_tokens,
-        )
-        raw = response.choices[0].message.content.strip()
-        # Strip markdown fences manually — no regex escaping issues
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            # Remove first line (```json or ```) and last line (```)
-            if lines[-1].strip() == "```":
-                lines = lines[1:-1]
-            elif lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            raw = "\n".join(lines)
-        return raw.strip()
+    @property
+    def llm_smart(self):
+        if self._llm_smart is None:
+            self._llm_smart = self._get_llm("llama-3.1-8b-instant")
+        return self._llm_smart
+
+    def _invoke(self, llm, prompt: str, max_retries: int = 3) -> str:
+        """
+        Invoke a LangChain LLM with retry logic for rate limits.
+        LangChain's .invoke() returns an AIMessage — we extract .content.
+        """
+        from langchain_core.messages import HumanMessage
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                message  = HumanMessage(content=prompt)
+                response = llm.invoke([message])
+                return _strip_fences(response.content)
+            except Exception as exc:
+                last_exc = exc
+                err = str(exc)
+                if "tokens per day" in err or "TPD" in err:
+                    log.error("Daily token limit reached", error=err)
+                    raise RuntimeError(
+                        "Groq daily token limit reached. "
+                        "Wait until tomorrow or use a new API key."
+                    ) from exc
+                elif "rate_limit" in err.lower() or "tokens per minute" in err:
+                    wait = 30 * (attempt + 1)
+                    log.warning("Rate limit — retrying", wait_secs=wait, attempt=attempt + 1)
+                    time.sleep(wait)
+                else:
+                    raise
+        raise last_exc
 
     def extract_structured(self, text: str, section: str = "") -> dict[str, list]:
+        """
+        Structured extraction using LangChain ChatGroq (fast 8b model).
+        Returns rates, tiers, surcharges, reductions, minimums for SQLite.
+        """
         empty = {"rates": [], "tiers": [], "surcharges": [], "reductions": [], "minimums": []}
         if len(text.strip()) < 50:
             return empty
         try:
-            # Append text after prompt — no string formatting needed
-            prompt = _STRUCTURED_PROMPT + text
-            # Use fast 8b model — structured JSON needs less reasoning power
-            raw = self._call_llm(prompt, model="llama-3.1-8b-instant")
+            raw  = self._invoke(self.llm_fast, _STRUCTURED_PROMPT + text)
             data = json.loads(raw)
             result = {k: data.get(k) or [] for k in empty}
-            total = sum(len(v) for v in result.values())
+            total  = sum(len(v) for v in result.values())
             log.info("Structured extraction done", section=section, total_rows=total)
             return result
         except Exception as exc:
@@ -109,11 +148,14 @@ class RuleExtractor:
             return empty
 
     def extract_semantic(self, text: str, section: str = "") -> list[dict[str, Any]]:
+        """
+        Semantic extraction using LangChain ChatGroq.
+        Returns rules, conditions, exemptions for ChromaDB.
+        """
         if len(text.strip()) < 50:
             return []
         try:
-            prompt = _SEMANTIC_PROMPT + text
-            raw = self._call_llm(prompt, max_tokens=2000)
+            raw   = self._invoke(self.llm_smart, _SEMANTIC_PROMPT + text, max_retries=3)
             rules = json.loads(raw)
             if not isinstance(rules, list):
                 rules = rules.get("rules", []) if isinstance(rules, dict) else []
@@ -138,14 +180,13 @@ class RuleExtractor:
             for key in all_structured:
                 all_structured[key].extend(structured.get(key, []))
 
-            time.sleep(1)  # brief pause between the two calls per section
+            time.sleep(1)
 
             semantic = self.extract_semantic(text, title)
             all_semantic.extend(semantic)
 
-            # Pause every 3 sections to respect rate limits
             if (i + 1) % 3 == 0:
-                log.info("Rate limit pause", after_section=i+1)
+                log.info("Rate limit pause", after_section=i + 1)
                 time.sleep(3)
 
         log.info(
