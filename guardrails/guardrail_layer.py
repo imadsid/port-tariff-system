@@ -1,5 +1,6 @@
 """
 guardrails/guardrail_layer.py
+Component 5 — Guardrail Layer
 Multi-stage quality and safety checks:
   1. InputValidator        — validates VesselQuery before calculation
   2. HallucinationDetector — checks amounts against known-reasonable ranges
@@ -42,7 +43,7 @@ class ValidationReport:
     business_violations: list[str] = field(default_factory=list)
 
 
-# 1. Input Validator
+# ── 1. Input Validator ────────────────────────────────────────────────────────
 
 class InputValidator:
 
@@ -62,8 +63,14 @@ class InputValidator:
             issues.append("port is required")
             score -= 0.3
         elif query.port.lower() not in _VALID_PORTS:
-            warnings.append(f"Port '{query.port}' is not in the known TNPA port list")
-            score -= 0.15
+            # Unknown port is a hard failure — not a warning.
+            # Calculating for an unknown port would silently use wrong rates.
+            valid_list = ", ".join(sorted(p.title() for p in _VALID_PORTS))
+            issues.append(
+                f"Port '{query.port}' is not a recognised TNPA port. "
+                f"Valid ports are: {valid_list}."
+            )
+            score -= 0.5
 
         if query.days_in_port < 0:
             issues.append("days_in_port cannot be negative")
@@ -80,7 +87,7 @@ class InputValidator:
         )
 
 
-# 2. Hallucination Detector
+# ── 2. Hallucination Detector ─────────────────────────────────────────────────
 
 class HallucinationDetector:
 
@@ -110,7 +117,7 @@ class HallucinationDetector:
         )
 
 
-# 3. Confidence Scorer
+# ── 3. Confidence Scorer ──────────────────────────────────────────────────────
 
 class ConfidenceScorer:
 
@@ -129,7 +136,7 @@ class ConfidenceScorer:
         return round(max(0.0, min(1.0, combined)), 3)
 
 
-# 4. Business Rules Enforcer
+# ── 4. Business Rules Enforcer ────────────────────────────────────────────────
 
 class BusinessRulesEnforcer:
 
@@ -170,7 +177,7 @@ class BusinessRulesEnforcer:
         return violations
 
 
-# 5. Output Validator
+# ── 5. Output Validator ───────────────────────────────────────────────────────
 
 class OutputValidator:
 
@@ -191,7 +198,7 @@ class OutputValidator:
         )
 
 
-# Guardrail Orchestrator
+# ── Guardrail Orchestrator ────────────────────────────────────────────────────
 
 class GuardrailLayer:
     """
